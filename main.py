@@ -48,27 +48,23 @@ CAP_LO = 1.0
 # place-level size model
 LEVEL_HIST_H = 6.0
 LEVEL_SHRINK = 0.15
-LEVEL_SLOPE_SHORT = 0.80
+LEVEL_SLOPE_SHORT = 0.50
 LEVEL_SLOPE_LONG = 0.12
 LEVEL_DAMP = 1.00
 LEVEL_H_CAP = 13.0
-LEVEL_GROWTH_CAP = 1.10
+LEVEL_GROWTH_CAP = 0.80
 OFFSET_PRIOR = [0.25, 0.03, 0.0, -0.03, -0.06]
 OFFSET_PRIOR_W = 0.55
 OFFSET_PRIOR_N = 5.0
-# Per-place size sd: sqrt(base^2 + (vk + SD_V1*v1)*h).  The 10/20-minute
-# practice transitions put place 1 near 0.1-0.15 dex and places 4-5 at
-# 0.3-0.4; the old model had place 1 widest, which was backwards.
-SD_BASE = [0.18, 0.20, 0.24, 0.28, 0.32]
-SD_VK = [0.008, 0.015, 0.020, 0.025, 0.030]
-SD_V1 = 0.30
-SIZE_SD_MIN = 0.12
+SIZE_SD_MIN = 0.22
+SIZE_SD_P1 = 0.08
 SIZE_SD_MAX = 0.95
+SIZE_SD_MULT = 1.25
 V1_DEFAULT = 0.035
 V1_MIN = 0.018
 V1_MAX = 0.050
 V1_SCALE = 0.60
-SIZE_MIX_WIDE = 0.10
+SIZE_MIX_WIDE = 0.15
 SIZE_WIDE_FACTOR = 1.8
 UNIFORM_MIX = 0.015
 
@@ -122,6 +118,14 @@ def quantile(values, q):
 
 def median(values):
     return quantile(values, 0.5)
+
+
+def mad_sd(values):
+    """A robust standard deviation from the median absolute deviation."""
+    if not values:
+        return 0.0
+    m = median(values)
+    return 1.4826 * median([abs(v - m) for v in values])
 
 
 def weighted_slope(points, weights):
@@ -446,7 +450,7 @@ def size_forecast(marks, cut_time, read_hours):
             last.append(last[-1] if last else 2.0)
         out = {}
         for h in read_hours:
-            out[h] = (list(last), [0.45 + 0.04 * math.sqrt(h)] * PLACES)
+            out[h] = (list(last), [SIZE_SD_MULT * (0.45 + 0.04 * math.sqrt(h))] * PLACES)
         return out
 
     # Window: last LEVEL_HIST_H hours, but always at least the last three marks.
@@ -477,9 +481,9 @@ def size_forecast(marks, cut_time, read_hours):
 
     out = {}
     for h in read_hours:
-        # Short horizons follow the local trend closely; beyond an hour it is
-        # extended but the total extrapolation is capped, so a transient pump
-        # at the cut cannot fly the whole size distribution away.
+        # Short horizons can follow the local trend closely; beyond an hour the
+        # trend is damped and the total extrapolation is capped, so a transient
+        # pump at the cut cannot fly the whole size distribution away.
         short = max(-LEVEL_SLOPE_SHORT, min(LEVEL_SLOPE_SHORT, slope)) * min(h, 1.0)
         long = (
             LEVEL_DAMP
@@ -492,8 +496,12 @@ def size_forecast(marks, cut_time, read_hours):
 
         sds = []
         for k in range(PLACES):
-            sd = math.sqrt(SD_BASE[k] ** 2 + (SD_VK[k] + SD_V1 * v1) * h)
-            sds.append(min(SIZE_SD_MAX, max(SIZE_SD_MIN, sd)))
+            residuals = [(caps[k] - median(caps)) - offsets[k] for _, caps in window]
+            rsd = mad_sd(residuals)
+            sd = math.sqrt(max(SIZE_SD_MIN, rsd) ** 2 + v1 * h)
+            if k == 0:
+                sd += SIZE_SD_P1
+            sds.append(SIZE_SD_MULT * min(SIZE_SD_MAX, max(SIZE_SD_MIN, sd)))
         out[h] = (means, sds)
     return out
 
@@ -620,23 +628,21 @@ def build_forecast(task, marks):
     unseen = estimate_unseen_share(marks, read_hours, chart_size)
     named, place_probs = order_forecast(states, preds, read_hours, unseen, MAX_ROWS_PER_PLACE)
 
-    # Size distributions: one distribution per place at the mean answer time.
-    # The forecast is one row per place scored at every read, so the predictor
-    # is the cap at the average horizon, not a seven-way mixture that smears
-    # the distribution over the early and late reads.
-    h_mean = sum(read_hours) / len(read_hours)
-    size_means_sds = size_forecast(marks, cut_time, [h_mean])
-    means, sds = size_means_sds[h_mean]
+    # Size distributions, averaged over the reads.
+    size_means_sds = size_forecast(marks, cut_time, read_hours)
     size_bins = {p: [0.0] * (len(edges) + 1) for p in range(1, places + 1)}
+    for h in read_hours:
+        means, sds = size_means_sds[h]
+        for p in range(1, places + 1):
+            mean, sd = means[p - 1], sds[p - 1]
+            core = bin_probabilities(mean, sd, edges)
+            wide = bin_probabilities(mean, sd * SIZE_WIDE_FACTOR, edges)
+            for b in range(len(edges) + 1):
+                prob = (1.0 - SIZE_MIX_WIDE) * core[b] + SIZE_MIX_WIDE * wide[b]
+                # A small uniform floor keeps a tail outcome above the scorer's
+                # 1e-4 floor without changing the peak materially.
+                size_bins[p][b] += (1.0 - UNIFORM_MIX) * prob + UNIFORM_MIX / (len(edges) + 1)
     for p in range(1, places + 1):
-        mean, sd = means[p - 1], sds[p - 1]
-        core = bin_probabilities(mean, sd, edges)
-        wide = bin_probabilities(mean, sd * SIZE_WIDE_FACTOR, edges)
-        for b in range(len(edges) + 1):
-            prob = (1.0 - SIZE_MIX_WIDE) * core[b] + SIZE_MIX_WIDE * wide[b]
-            # A small uniform floor keeps a tail outcome above the scorer's
-            # 1e-4 floor without changing the peak materially.
-            size_bins[p][b] = (1.0 - UNIFORM_MIX) * prob + UNIFORM_MIX / (len(edges) + 1)
         total = sum(size_bins[p])
         if total > 0.0:
             size_bins[p] = [x / total for x in size_bins[p]]
