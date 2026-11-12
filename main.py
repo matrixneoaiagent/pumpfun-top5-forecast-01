@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """pumpfun-top5-forecast-01 entry.
 
-Reads the house's 10-minute marks of pump.fun coins, builds a damped-momentum
-model of each known coin's log10 market cap, estimates the share of each place
-that will be taken by coins the history cannot name (newcomers), and writes one
-forecast scored at all seven answer reads.
+Reads the house's 10-minute marks of pump.fun coins, simulates 4,000
+damped-momentum/mean-reverting log10 market-cap paths for each known coin
+(with jumps, death and a newborn contender field), estimates the share of each
+place taken by coins the history cannot name, and writes one forecast scored
+at all seven answer reads.
 
 Standard library only, deterministic, no network.  The output is
 $MAKEFUN_OUTPUT_DIR/forecast.json (or /output/forecast.json).
 """
 
+import bisect
+import heapq
 import json
 import math
 import os
+import random
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------- #
@@ -79,6 +83,20 @@ RANK_FIELD = 20          # soft ranks are measured inside this leading field
 W_PRIOR = 0.50
 W_MIN = 0.15
 W_MAX = 0.85
+
+# Monte Carlo path model
+MC_PATHS = 4000
+MC_SEED = 20261112
+MC_VOL_MULT = 2.50
+MC_THETA = 0.40
+MC_P_JUMP = 0.03
+MC_JUMP_SD = 0.40
+MC_DEATH_CAP = 1.45
+MC_NEW_K = 20
+MC_NEW_SHIFT = -0.80
+MC_NEW_SD = 0.45
+MC_NEW_NOISE = 0.10
+MC_P_PUMP = 0.04
 
 
 # --------------------------------------------------------------------------- #
@@ -582,6 +600,192 @@ def order_forecast(states, preds, read_hours, unseen, top_n):
 
 
 # --------------------------------------------------------------------------- #
+# Monte Carlo path model
+# --------------------------------------------------------------------------- #
+def norm_ppf(p):
+    """Acklam's inverse normal CDF (absolute error < 1.15e-9)."""
+    if p <= 0.0:
+        return -8.0
+    if p >= 1.0:
+        return 8.0
+    a = [-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285104469687e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00]
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    if p > phigh:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+
+
+def estimate_birth_rate(marks):
+    """New eligible coins per hour from the mark counts."""
+    counts = []
+    for mark in marks:
+        c = (mark.get("counts") or {}).get("eligible")
+        if isinstance(c, (int, float)):
+            counts.append((parse_time(mark["at"]), float(c)))
+    if len(counts) < 2:
+        return 1800.0
+    t0, c0 = counts[0]
+    t1, c1 = counts[-1]
+    dh = (t1 - t0) / 3600.0
+    if dh <= 0.0 or c1 <= c0:
+        return 1800.0
+    return max(200.0, min(10000.0, (c1 - c0) / dh))
+
+
+def simulate_mc(task, marks, paths=MC_PATHS, seed=MC_SEED):
+    """Simulate known-coin cap paths and a newborn contender field.
+
+    Returns (mints, raw place probabilities, named indices, size bins,
+    top-order indices, unseen shares).  Raw place probabilities are the
+    fraction of paths/reads each known coin holds each place; the newborn
+    field takes the rest.
+    """
+    edges = [float(x) for x in task["size"]["edges"]]
+    bins = len(edges) + 1
+    chart_size = int(task.get("chart_size") or 100)
+    places = min(5, int(task.get("places") or 5))
+    cut = max(parse_time(m["at"]) for m in marks)
+    reads = [parse_time(x) for x in task.get("reads", [])]
+    hs = sorted({round((t - cut) / 3600.0, 6) for t in reads if t > cut})
+    if not hs:
+        ans = parse_time(task.get("window", {}).get("answer_at") or marks[-1]["at"])
+        hs = [max(0.0, (ans - cut) / 3600.0)]
+    states = build_coin_states(marks, cut, chart_size)
+    mints = sorted(states)
+    n = len(mints)
+    priors = bucket_priors(states)
+
+    mu = []
+    sig = []
+    hazard = []
+    death_cap = []
+    for mint in mints:
+        s = states[mint]
+        mu.append([predict_coin(s, h, priors)[0] for h in hs])
+        base = predict_coin(s, 0.0, priors)[1]
+        venue = s["venue"]
+        vv = 1.0 if venue == "pool" else (1.15 if venue == "curve" else 0.85)
+        va = 1.15 if s["age"] < 0.5 else (1.08 if s["age"] < 2.0 else (1.0 if s["age"] < 6.0 else 0.9))
+        vr = 1.10 if s["rank"] > 50 else (1.05 if s["rank"] > 20 else 1.0)
+        sig.append(min(0.95, max(0.15, base * MC_VOL_MULT * vv * va * vr)))
+        hz = 0.02 if venue == "pool" else (0.05 if venue == "curve" else 0.03)
+        if s["rank"] <= 5:
+            hz *= 0.5
+        elif s["rank"] <= 20:
+            hz *= 0.8
+        elif s["rank"] <= 50:
+            hz *= 1.2
+        else:
+            hz *= 1.5
+        if s["age"] > 3.0:
+            hz += 0.02
+        if s["age"] < 0.25:
+            hz += 0.02
+        hazard.append(max(0.002, min(0.15, hz)))
+        death_cap.append(min(1.45, max(1.0, s["c0"])))
+
+    # Align the simulated top-five level to the deterministic size level at
+    # each read.  This keeps the round-1 centre while the MC supplies the
+    # dispersion and the newborn tail.
+    det = size_forecast(marks, cut, hs)
+    for r, h in enumerate(hs):
+        top_mu = sorted((mu[i][r] for i in range(n)), reverse=True)[:5]
+        delta = det[h][0][2] - median(top_mu)
+        for i in range(n):
+            mu[i][r] += delta
+
+    unseen = estimate_unseen_share(marks, hs, chart_size)
+    rate = estimate_birth_rate(marks)
+    newborn = []
+    for h in hs:
+        level = det[h][0][2]
+        m5 = det[h][0][4]
+        bp = max(1.0, MC_P_PUMP * rate * h)
+        k = min(MC_NEW_K, max(1, int(bp)))
+        z = [norm_ppf(1.0 - (j + 1.0) / (bp + 1.0)) for j in range(k)]
+        pots = [level + MC_NEW_SHIFT + MC_NEW_SD * zz for zz in z]
+        count = sum(1 for x in pots if x > m5)
+        target = 5.0 * unseen[h]
+        p_enter = min(1.0, target / max(1, count))
+        newborn.append((pots, p_enter))
+
+    rng = random.Random(seed)
+    place_counts = [[0] * places for _ in range(n)]
+    size_counts = [[0] * bins for _ in range(places)]
+    c0 = [states[m]["c0"] for m in mints]
+    for _ in range(paths):
+        caps = list(c0)
+        alive = [True] * n
+        prev_h = 0.0
+        for r, h in enumerate(hs):
+            dt = max(1e-9, h - prev_h)
+            sqrt_dt = math.sqrt(dt)
+            for i in range(n):
+                if not alive[i]:
+                    caps[i] = death_cap[i]
+                    continue
+                c = caps[i]
+                c += MC_THETA * (mu[i][r] - c) * dt + sig[i] * sqrt_dt * rng.gauss(0.0, 1.0)
+                if rng.random() < MC_P_JUMP * dt:
+                    c += rng.gauss(0.0, MC_JUMP_SD)
+                if rng.random() < hazard[i] * dt:
+                    alive[i] = False
+                    c = death_cap[i]
+                if c < CAP_LO:
+                    c = CAP_LO
+                elif c > CAP_HI:
+                    c = CAP_HI
+                caps[i] = c
+            prev_h = h
+            pots, p_enter = newborn[r]
+            new = []
+            for x in pots:
+                if rng.random() < p_enter:
+                    new.append(x + rng.gauss(0.0, MC_NEW_NOISE))
+                else:
+                    new.append(MC_DEATH_CAP)
+            all_caps = caps + new
+            top = heapq.nlargest(places, range(len(all_caps)), key=all_caps.__getitem__)
+            for k, idx in enumerate(top):
+                b = bisect.bisect_right(edges, all_caps[idx])
+                if b >= bins:
+                    b = bins - 1
+                size_counts[k][b] += 1
+                if idx < n:
+                    place_counts[idx][k] += 1
+
+    denom = float(paths * len(hs))
+    raw = [[place_counts[i][k] / denom for k in range(places)] for i in range(n)]
+    named = sorted(range(n), key=lambda i: (-sum(raw[i]), mints[i]))[:MAX_ROWS_PER_PLACE]
+    size_bins = []
+    for k in range(places):
+        total = float(sum(size_counts[k]))
+        size_bins.append([0.99 * (x / total) + 0.01 / bins for x in size_counts[k]])
+    top_order = sorted(range(n), key=lambda i: (-sum(raw[i]), mints[i]))[:places]
+    return mints, raw, named, size_bins, top_order, unseen
+
+
+# --------------------------------------------------------------------------- #
 # Forecast assembly
 # --------------------------------------------------------------------------- #
 def build_forecast(task, marks):
@@ -620,53 +824,36 @@ def build_forecast(task, marks):
             ],
         }
 
-    priors = bucket_priors(states)
-    preds = {}
-    for h in read_hours:
-        preds[h] = {m: predict_coin(s, h, priors) for m, s in states.items()}
+    mints, raw, _named, size_bins, _top_order, unseen = simulate_mc(task, marks)
 
-    unseen = estimate_unseen_share(marks, read_hours, chart_size)
-    named, place_probs = order_forecast(states, preds, read_hours, unseen, MAX_ROWS_PER_PLACE)
+    # The MC known-coin share can be larger than the history-calibrated
+    # newcomer share.  Leave the latter unnamed: scale each place's named mass
+    # down to 1 - mean W if needed.  The relative shape among coins is kept.
+    w_mean = sum(unseen.values()) / len(unseen)
+    target = max(0.0, min(1.0, 1.0 - w_mean))
+    scaled = [row[:] for row in raw]
+    for k in range(places):
+        s = sum(raw[i][k] for i in range(len(mints)))
+        if s > target and s > 0.0:
+            fac = target / s
+            for i in range(len(mints)):
+                scaled[i][k] *= fac
 
-    # Size distributions, averaged over the reads.
-    size_means_sds = size_forecast(marks, cut_time, read_hours)
-    size_bins = {p: [0.0] * (len(edges) + 1) for p in range(1, places + 1)}
-    for h in read_hours:
-        means, sds = size_means_sds[h]
-        for p in range(1, places + 1):
-            mean, sd = means[p - 1], sds[p - 1]
-            core = bin_probabilities(mean, sd, edges)
-            wide = bin_probabilities(mean, sd * SIZE_WIDE_FACTOR, edges)
-            for b in range(len(edges) + 1):
-                prob = (1.0 - SIZE_MIX_WIDE) * core[b] + SIZE_MIX_WIDE * wide[b]
-                # A small uniform floor keeps a tail outcome above the scorer's
-                # 1e-4 floor without changing the peak materially.
-                size_bins[p][b] += (1.0 - UNIFORM_MIX) * prob + UNIFORM_MIX / (len(edges) + 1)
-    for p in range(1, places + 1):
-        total = sum(size_bins[p])
-        if total > 0.0:
-            size_bins[p] = [x / total for x in size_bins[p]]
-
-    # Probability rows: only the named field, sorted deterministically.  The
-    # mass a place leaves unnamed is 1 - sum(rows), which is what pays for the
-    # coins born after the cut (and any history coin outside the named 100).
+    named = sorted(range(len(mints)), key=lambda i: (-sum(scaled[i]), mints[i]))[:MAX_ROWS_PER_PLACE]
     probabilities = []
     for p in range(1, places + 1):
-        items = [(m, place_probs[m][p]) for m in named]
+        items = [(mints[i], scaled[i][p - 1]) for i in named]
         items.sort(key=lambda x: (-x[1], x[0]))
-        s = sum(v for _, v in items)
-        if s > 1.0:
-            items = [(m, v / s) for m, v in items]
-        for m, v in items:
-            probabilities.append({"mint": m, "place": p, "p": max(0.0, min(1.0, v))})
+        if sum(v for _, v in items) > 1.0:
+            fac = 1.0 / sum(v for _, v in items)
+            items = [(m, v * fac) for m, v in items]
+        for mint, v in items:
+            probabilities.append({"mint": mint, "place": p, "p": max(0.0, min(1.0, v))})
 
-    # top5: the five coins with the highest expected place value.
-    score = {}
-    for m in named:
-        score[m] = sum(place_probs[m][p] * (places + 1 - p) for p in range(1, places + 1))
-    top5 = sorted(named, key=lambda m: (-score[m], m))[:places]
+    # top5: the five coins with the highest summed place probabilities.
+    top_idx = sorted(range(len(mints)), key=lambda i: (-sum(scaled[i]), mints[i]))[:places]
+    top5 = [mints[i] for i in top_idx]
     if len(top5) < places:
-        # pad from history in rank order
         for mark in reversed(marks):
             for row in sorted(mark["rows"], key=lambda r: int(r.get("rank") or 10 ** 9)):
                 if row["mint"] not in top5:
@@ -678,7 +865,7 @@ def build_forecast(task, marks):
 
     sizes = []
     for p in range(1, places + 1):
-        for b, prob in enumerate(size_bins[p]):
+        for b, prob in enumerate(size_bins[p - 1]):
             sizes.append({"place": p, "bin": b, "p": max(0.0, min(1.0, prob))})
 
     return {"probabilities": probabilities, "top5": top5[:places], "sizes": sizes}
